@@ -282,9 +282,12 @@ struct AskCard: View {
                                 HStack { options(q) }
                                 VStack(alignment: .leading) { options(q) }
                             }
-                            TextField("Or type an answer", text: Binding(get: { answers[q.id] ?? "" }, set: { answers[q.id] = $0 }))
-                                .textFieldStyle(.roundedBorder)
-                                .onSubmit { if answers.count == ask.questions.count { respond(true, answers) } }
+                            let typed = Binding(get: { answers[q.id] ?? "" }, set: { answers[q.id] = $0 })
+                            Group {
+                                if q.secret { SecureField("Answer", text: typed) } else { TextField("Or type an answer", text: typed) }
+                            }
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { if answers.count == ask.questions.count { respond(true, answers) } }
                         }
                     }
                 }
@@ -310,13 +313,19 @@ struct AskCard: View {
     }
 
     private func options(_ q: Ask.Question) -> some View {
-        ForEach(q.options, id: \.self) { option in
+        let picked = Set((answers[q.id] ?? "").components(separatedBy: ", "))
+        return ForEach(q.options, id: \.self) { option in
             Button(option) {
-                answers[q.id] = option
-                if ask.questions.count == 1 { respond(true, answers) }  // one question: picking is answering
+                if q.multi {  // toggle; Send submits
+                    let next = picked.symmetricDifference([option])
+                    answers[q.id] = q.options.filter(next.contains).joined(separator: ", ")
+                } else {
+                    answers[q.id] = option
+                    if ask.questions.count == 1 { respond(true, answers) }  // one plain question: picking is answering
+                }
             }
             .buttonStyle(.bordered)
-            .tint(answers[q.id] == option ? .accentColor : nil)
+            .tint(picked.contains(option) ? .accentColor : nil)
         }
     }
 }

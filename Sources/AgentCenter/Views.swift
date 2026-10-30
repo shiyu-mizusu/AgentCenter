@@ -200,14 +200,17 @@ struct Home: View {
             .frame(maxWidth: .infinity)
         }
         .onAppear { focused = true }
+        .onChange(of: model.draft) {  // editing the request makes the proposed route stale
+            if let plan = model.plan, plan.request != model.draft.trimmed { model.plan = nil }
+        }
     }
 
     /// Return routes the request; Return again (unchanged text) starts the plan the AI proposed.
     private func submit() {
         let text = model.draft.trimmed
         guard !text.isEmpty, !model.thinking else { return }
-        if let plan = model.plan, plan.request == text, !plan.cwd.isEmpty {
-            model.startPlan()
+        if let plan = model.plan, plan.request == text {
+            model.startPlan()  // no-op until a folder is picked
         } else {
             Task { await model.route(text) }
         }
@@ -237,7 +240,7 @@ struct PlanCard: View {
                     .foregroundStyle(.secondary)
             }
             HStack {
-                Menu("Change") {
+                Menu(plan.cwd.isEmpty ? "Choose Project" : "Change") {
                     Section("Agent") {
                         ForEach(model.agents) { agent in
                             Button(agent.name) { model.plan?.agent = agent; if plan.session?.agent != agent { model.plan?.session = nil } }
@@ -371,6 +374,7 @@ struct SessionView: View {
             Transcript(items: model.transcripts[session.id], running: running)
             if let ask = model.asks[session.id]?.first {
                 AskCard(ask: ask) { allow, answers in model.respond(ask, in: session.id, allow: allow, answers: answers) }
+                    .id(ask.id)  // fresh answers for each new ask
             }
             Composer(agent: session.agent, running: running, placeholder: "Reply to \(session.agent.name)…",
                      onSend: { model.send($0, to: session) }, onStop: { model.stop(session.id) })

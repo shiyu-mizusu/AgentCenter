@@ -365,7 +365,8 @@ enum Claude {
                     let questions = (toolInput["questions"] as? [[String: Any]] ?? []).map { q in
                         Ask.Question(id: q["question"] as? String ?? "", header: q["header"] as? String ?? "",
                                      text: q["question"] as? String ?? "",
-                                     options: (q["options"] as? [[String: Any]] ?? []).compactMap { $0["label"] as? String })
+                                     options: (q["options"] as? [[String: Any]] ?? []).compactMap { $0["label"] as? String },
+                                     multi: q["multiSelect"] as? Bool == true)
                     }
                     out.yield(.ask(Ask(id: rid, title: "Claude has a question", questions: questions) { allow, answers in
                         var input = toolInput

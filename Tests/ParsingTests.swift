@@ -64,8 +64,10 @@ final class ParsingTests: XCTestCase {
         XCTAssertNil(p2.session)
         XCTAssertEqual(p2.cwd, "/dev/web")
 
-        // A project index out of range never becomes a path: it asks instead.
-        guard case .answer = decide(["action": "new", "agent": "claude", "project": 7, "answer": ""]) else { return XCTFail() }
+        // A project index out of range never becomes a path: the request waits for the person to pick a folder.
+        guard case .run(let unknown) = decide(["action": "new", "agent": "claude", "project": 7, "answer": ""]) else { return XCTFail() }
+        XCTAssertEqual(unknown.cwd, "")
+        XCTAssertEqual(unknown.request, "do it")
 
         // An agent that isn't installed is swapped for one that is.
         guard case .run(let p3) = decide(["action": "new", "agent": "codex", "project": 1], agents: [.claude]) else { return XCTFail() }

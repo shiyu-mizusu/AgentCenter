@@ -75,6 +75,8 @@ struct Ask: Identifiable {
         let header: String
         let text: String
         let options: [String]
+        var multi = false   // several options may be picked; sent as "A, B"
+        var secret = false  // typed answer is hidden (a password or token)
     }
 
     let id: String
@@ -263,6 +265,7 @@ struct AppError: LocalizedError {
         var key = id ?? "pending-" + UUID().uuidString
         let access = access ?? Access(rawValue: UserDefaults.standard.string(forKey: "access") ?? "") ?? .ai
         failed.remove(key)
+        triage[key] = nil  // a new turn makes the old verdict (and its suggested reply) wrong; re-triaged after the run
         transcripts[key, default: []].append(Item(id: UUID().uuidString, kind: .user, text: prompt))
         let run = agent == .claude
             ? Claude.run(prompt: prompt, cwd: cwd, resume: id, access: access)
@@ -377,7 +380,11 @@ struct AppError: LocalizedError {
 
     func startPlan() {
         guard let p = plan, !p.cwd.isEmpty else { return }
-        if start(p.request, agent: p.agent, cwd: p.cwd, resuming: p.session?.id), let s = p.session { selection = s.id }
+        guard start(p.request, agent: p.agent, cwd: p.cwd, resuming: p.session?.id) else {
+            plan?.reason = "“\(p.session?.title.firstLine(50) ?? "That session")” is still running. Wait for it, or start a new session."
+            return
+        }
+        if let s = p.session { selection = s.id }
         plan = nil
         draft = ""
     }

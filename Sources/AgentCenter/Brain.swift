@@ -32,7 +32,7 @@ enum Brain {
             - "continue": send the request to an existing session, when it clearly follows up on that session's work.
             - "answer": the developer is asking about their own work (status, what needs them, what happened). Answer in \
             `answer` from the session list below only, short and plain; put the ids of sessions you mention in `sessions`.
-            - "ask": you can't tell which project they mean. Ask one short question in `answer`.
+            - "ask": you can't tell which project they mean. Ask one short question in `answer`; they'll pick the folder.
 
             Rules:
             - `project`: index of the project the request names or clearly concerns, from the list below; -1 if none. \
@@ -60,25 +60,24 @@ enum Brain {
         let text = (raw["answer"] as? String ?? "").trimmed
         let reason = (raw["reason"] as? String ?? "").trimmed
         switch raw["action"] as? String {
-        case "answer", "ask":
+        case "answer":
             let linked = (raw["sessions"] as? [String] ?? []).compactMap { id in sessions.first { $0.id == id } }
-            return .answer(Answer(text: text.isEmpty ? "Which project is this for?" : text, sessions: linked))
+            return .answer(Answer(text: text.isEmpty ? "I couldn't find anything on that." : text, sessions: linked))
         case "continue":
             if let s = sessions.first(where: { $0.id == raw["session"] as? String }), agents.contains(s.agent) {
                 return .run(Plan(request: request, agent: s.agent, cwd: s.cwd, session: s, reason: reason))
             }
             fallthrough
-        default:
+        default:  // "new", or "ask" when it can't tell the project
             let wanted = Agent(rawValue: raw["agent"] as? String ?? "")
             let agent = wanted.flatMap { agents.contains($0) ? $0 : nil } ?? agents.first ?? .claude
             let index = (raw["project"] as? NSNumber)?.intValue ?? -1
-            if projects.indices.contains(index) {
+            if raw["action"] as? String != "ask", projects.indices.contains(index) {
                 return .run(Plan(request: request, agent: agent, cwd: projects[index].path, session: nil, reason: reason))
             }
-            if projects.isEmpty {
-                return .run(Plan(request: request, agent: agent, cwd: "", session: nil, reason: "Choose a folder to work in."))
-            }
-            return .answer(Answer(text: text.isEmpty ? "Which project is this for?" : text, sessions: []))
+            // Unknown project: keep the request and let the person pick the folder, rather than guess.
+            let question = raw["action"] as? String == "ask" && !text.isEmpty ? text : "Which project? Pick one, or choose a folder."
+            return .run(Plan(request: request, agent: agent, cwd: "", session: nil, reason: question))
         }
     }
 
@@ -142,14 +141,16 @@ enum Brain {
             defer { try? FileManager.default.removeItem(at: dir) }
             let schemaFile = dir.appendingPathComponent("schema.json"), answerFile = dir.appendingPathComponent("answer.json")
             try Data(schemaJSON.utf8).write(to: schemaFile)
-            do {
+            do {  // isolated like the Claude call: no user config (so no MCP servers or hooks), rules or skills; read-only
                 _ = try await Env.output(codex, ["exec", "-", "--ephemeral", "--skip-git-repo-check", "-s", "read-only",
+                                                 "--ignore-user-config", "--ignore-rules", "-c", "skills.include_instructions=false",
                                                  "-c", "model_reasoning_effort=\"low\"", "--output-schema", schemaFile.path,
                                                  "-o", answerFile.path], input: prompt, cwd: dir.path, timeout: 120)
                 if let result = (try? Data(contentsOf: answerFile)).flatMap(json) { return result }
                 failure = "Codex gave no answer."
-            } catch {
-                failure = error.localizedDescription
+            } catch {  // Codex prints a session header to stderr; keep just its last ERROR line
+                let message = error.localizedDescription
+                failure = message.components(separatedBy: "\n").last { $0.hasPrefix("ERROR: ") }.map { String($0.dropFirst(7)) } ?? message
             }
         }
         throw AppError(failure)

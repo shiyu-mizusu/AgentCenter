@@ -206,7 +206,8 @@ import Foundation
                 guard let requestID else { return }
                 let questions = (p["questions"] as? [[String: Any]] ?? []).map { q in
                     Ask.Question(id: q["id"] as? String ?? "", header: q["header"] as? String ?? "", text: q["question"] as? String ?? "",
-                                 options: (q["options"] as? [[String: Any]] ?? []).compactMap { $0["label"] as? String })
+                                 options: (q["options"] as? [[String: Any]] ?? []).compactMap { $0["label"] as? String },
+                                 secret: q["isSecret"] as? Bool == true)
                 }
                 out.yield(.ask(Ask(id: "\(requestID)", title: "Codex has a question", questions: questions) { [weak self] allow, answers in
                     let reply = allow ? answers.mapValues { ["answers": [$0]] } : [:]
