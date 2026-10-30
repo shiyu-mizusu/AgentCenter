@@ -254,7 +254,9 @@ enum Claude {
             guard !finished else { return }
             finished = true
             try? stdin.close()
-            if stopped { out.yield(.item(Item(id: UUID().uuidString, kind: .status, text: "Stopped"))) }
+            if stopped, !items.contains(where: { $0.text == "Interrupted" }) {  // the CLI usually says so itself
+                out.yield(.item(Item(id: UUID().uuidString, kind: .status, text: "Stopped")))
+            }
             out.yield(.done(stopped ? nil : error))
             out.finish()
         }
