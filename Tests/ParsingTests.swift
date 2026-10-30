@@ -31,6 +31,45 @@ final class ParsingTests: XCTestCase {
         XCTAssertEqual(items[1].detail, "1 failing")
         XCTAssertTrue(items[1].failed)
         XCTAssertEqual(items[3].text, "/review src")
+
+        // The last request (the /review command) came after the agent's last words: no reply yet.
+        let last = try XCTUnwrap(Claude.lastExchange(url))
+        XCTAssertEqual(last.prompt, "/review src")
+        XCTAssertEqual(last.reply, "(no reply to this yet)")
+
+        // A run that kept calling tools after its last words, with the request scrolled out of the tail.
+        let busy = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).jsonl")
+        try [lines[3], lines[7], lines[4]].joined(separator: "\n").write(to: busy, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: busy) }
+        let working = try XCTUnwrap(Claude.lastExchange(busy))
+        XCTAssertEqual(working.prompt, "(earlier in the session)")
+        XCTAssertEqual(working.reply, "Fixed it.\n\n(After this message it kept calling tools.)")
+    }
+
+    func testRouteDecisionOnlyActsOnKnownTargets() {
+        let projects = [Project(path: "/dev/web"), Project(path: "/dev/api")]
+        let api = Session(id: "t1", agent: .codex, title: "Fix flaky test", cwd: "/dev/api", updated: .now)
+        func decide(_ raw: [String: Any], agents: [Agent] = [.claude, .codex]) -> Decision {
+            Brain.decision(raw, request: "do it", projects: projects, sessions: [api], agents: agents)
+        }
+
+        // Continuing a known session uses that session's agent and folder, whatever agent the model named.
+        guard case .run(let p1) = decide(["action": "continue", "session": "t1", "agent": "claude", "project": 0]) else { return XCTFail() }
+        XCTAssertEqual(p1.session?.id, "t1")
+        XCTAssertEqual(p1.agent, .codex)
+        XCTAssertEqual(p1.cwd, "/dev/api")
+
+        // An unknown session falls back to a new session in the named project.
+        guard case .run(let p2) = decide(["action": "continue", "session": "nope", "agent": "claude", "project": 0]) else { return XCTFail() }
+        XCTAssertNil(p2.session)
+        XCTAssertEqual(p2.cwd, "/dev/web")
+
+        // A project index out of range never becomes a path: it asks instead.
+        guard case .answer = decide(["action": "new", "agent": "claude", "project": 7, "answer": ""]) else { return XCTFail() }
+
+        // An agent that isn't installed is swapped for one that is.
+        guard case .run(let p3) = decide(["action": "new", "agent": "codex", "project": 1], agents: [.claude]) else { return XCTFail() }
+        XCTAssertEqual(p3.agent, .claude)
     }
 
     func testCodexItems() {

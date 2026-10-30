@@ -3,31 +3,122 @@ import SwiftUI
 struct Transcript: View {
     let items: [Item]?
     let running: Bool
+    @State private var atBottom: String?  // id of the row at the bottom edge, updated as you scroll
+
+    init(items: [Item]?, running: Bool) {
+        self.items = items
+        self.running = running
+    }
 
     var body: some View {
         if let items {
+            let rows = Self.rows(items)
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                        ForEach(items) { ItemView(item: $0) }
+                        ForEach(rows) { row in
+                            switch row {
+                            case .item(let item): ItemView(item: item)
+                            case .steps(let steps): StepsView(steps: steps)
+                            }
+                        }
                         if running {
                             ProgressView().controlSize(.small)
                         }
                         Color.clear.frame(height: 1).id("bottom")
                     }
+                    .scrollTargetLayout()
                     .padding(.horizontal, 24)
                     .padding(.vertical, 20)
                     .frame(maxWidth: 820)
                     .frame(maxWidth: .infinity)
                 }
+                .scrollPosition(id: $atBottom, anchor: .bottom)
                 .defaultScrollAnchor(.bottom)
-                .onChange(of: items.count) { proxy.scrollTo("bottom", anchor: .bottom) }
-                .onChange(of: items.last?.text.count) { if running { proxy.scrollTo("bottom", anchor: .bottom) } }
+                .onChange(of: items.count) { follow(proxy, rows: rows, sent: items.last?.kind == .user) }
+                .onChange(of: items.last?.text.count) { follow(proxy, rows: rows) }
             }
         } else {
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    enum Row: Identifiable {
+        case item(Item)
+        case steps([Item])
+
+        var id: String {
+            switch self {
+            case .item(let item): item.id
+            case .steps(let steps): "steps-" + (steps.first?.id ?? "")
+            }
+        }
+    }
+
+    /// Three or more tool calls in a row fold into one "N steps" row, so the conversation stays readable.
+    static func rows(_ items: [Item]) -> [Row] {
+        var rows: [Row] = [], run: [Item] = []
+        func flush() {
+            if run.count >= 3 { rows.append(.steps(run)) } else { rows += run.map(Row.item) }
+            run = []
+        }
+        for item in items {
+            if item.kind == .tool { run.append(item) } else { flush(); rows.append(.item(item)) }
+        }
+        flush()
+        return rows
+    }
+
+    /// Keeps up with new output only while you're at the bottom, so reading older output isn't interrupted.
+    private func follow(_ proxy: ScrollViewProxy, rows: [Row], sent: Bool = false) {
+        let tail = [nil, "bottom"] + rows.suffix(2).map { Optional($0.id) }
+        guard sent || tail.contains(atBottom) else { return }
+        proxy.scrollTo("bottom", anchor: .bottom)
+    }
+}
+
+/// A folded run of tool calls: one line with the count, expandable to every step.
+struct StepsView: View {
+    let steps: [Item]
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button { expanded.toggle() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Text("\(steps.count) steps")
+                        .fontWeight(.medium)
+                    let failures = steps.filter(\.failed).count
+                    if failures > 0 {
+                        Text("· \(failures) failed").foregroundStyle(.red)
+                    }
+                    Text("· " + Self.summary(steps))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if expanded {
+                ForEach(steps) { ItemView(item: $0) }
+                    .padding(.leading, 14)
+            }
+        }
+    }
+
+    /// "Read, Edit, $ npm test" — the distinct kinds of work, in order.
+    private static func summary(_ steps: [Item]) -> String {
+        var seen = Set<String>()
+        return steps.map { $0.text.split(separator: " ").first.map(String.init) ?? $0.text }
+            .filter { seen.insert($0).inserted }
+            .prefix(5)
+            .joined(separator: ", ")
     }
 }
 
@@ -151,33 +242,64 @@ struct MarkdownText: View {
     }
 }
 
-struct ApprovalCard: View {
-    let approval: Approval
-    let answer: (Bool) -> Void
+/// What an agent is waiting on: Allow / Deny for one action, or its questions with one-click answers.
+struct AskCard: View {
+    let ask: Ask
+    let respond: (_ allow: Bool, _ answers: [String: String]) -> Void
+    @State private var answers: [String: String] = [:]
+
+    init(ask: Ask, respond: @escaping (_ allow: Bool, _ answers: [String: String]) -> Void) {
+        self.ask = ask
+        self.respond = respond
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "hand.raised.fill")
+            Image(systemName: ask.questions.isEmpty ? "hand.raised.fill" : "questionmark.bubble.fill")
                 .font(.title3)
                 .foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Permission needed")
-                    .font(.headline)
-                Text(approval.title)
-                    .font(.callout.monospaced())
-                    .lineLimit(4)
-                    .textSelection(.enabled)
-                if !approval.detail.isEmpty {
-                    Text(approval.detail)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(8)
+            VStack(alignment: .leading, spacing: 8) {
+                if ask.questions.isEmpty {
+                    Text("Permission needed")
+                        .font(.headline)
+                    Text(ask.title)
+                        .font(.callout.monospaced())
+                        .lineLimit(4)
+                        .textSelection(.enabled)
+                    if !ask.detail.isEmpty {
+                        Text(ask.detail)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(8)
+                    }
+                } else {
+                    Text(ask.title)
+                        .font(.headline)
+                    ForEach(ask.questions) { q in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(q.text)
+                            ViewThatFits(in: .horizontal) {
+                                HStack { options(q) }
+                                VStack(alignment: .leading) { options(q) }
+                            }
+                            TextField("Or type an answer", text: Binding(get: { answers[q.id] ?? "" }, set: { answers[q.id] = $0 }))
+                                .textFieldStyle(.roundedBorder)
+                                .onSubmit { if answers.count == ask.questions.count { respond(true, answers) } }
+                        }
+                    }
                 }
             }
             Spacer(minLength: 12)
-            Button("Deny") { answer(false) }
-            Button("Allow") { answer(true) }
-                .buttonStyle(.borderedProminent)
+            if ask.questions.isEmpty {
+                Button("Deny") { respond(false, [:]) }
+                Button("Allow") { respond(true, [:]) }
+                    .buttonStyle(.borderedProminent)
+            } else {
+                Button("Skip") { respond(false, [:]) }
+                Button("Send") { respond(true, answers) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(answers.values.filter { !$0.trimmed.isEmpty }.count < ask.questions.count)
+            }
         }
         .padding(14)
         .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
@@ -185,6 +307,17 @@ struct ApprovalCard: View {
         .frame(maxWidth: 788)
         .padding(.horizontal, 16)
         .padding(.top, 8)
+    }
+
+    private func options(_ q: Ask.Question) -> some View {
+        ForEach(q.options, id: \.self) { option in
+            Button(option) {
+                answers[q.id] = option
+                if ask.questions.count == 1 { respond(true, answers) }  // one question: picking is answering
+            }
+            .buttonStyle(.bordered)
+            .tint(answers[q.id] == option ? .accentColor : nil)
+        }
     }
 }
 
@@ -197,7 +330,7 @@ struct Composer: View {
 
     @State private var text = ""
     @FocusState private var focused: Bool
-    @AppStorage private var mode: String
+    @AppStorage("access") private var access: Access = .ai
 
     init(agent: Agent, running: Bool = false, placeholder: String,
          onSend: @escaping (String) -> Void, onStop: @escaping () -> Void = {}) {
@@ -206,7 +339,6 @@ struct Composer: View {
         self.placeholder = placeholder
         self.onSend = onSend
         self.onStop = onStop
-        _mode = AppStorage(wrappedValue: "", agent.modeKey)
     }
 
     var body: some View {
@@ -217,13 +349,13 @@ struct Composer: View {
                 .focused($focused)
                 .onSubmit(send)
             HStack {
-                Picker("Permissions", selection: $mode) {
-                    ForEach(agent.modes, id: \.id) { Text($0.name).tag($0.id) }
+                Picker("Access", selection: $access) {
+                    ForEach(Access.allCases) { Label($0.name, systemImage: $0.icon).tag($0) }
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .fixedSize()
-                .help("What \(agent.name) may do without asking")
+                .help("What \(agent.name) may do without asking. AI decides: its own reviewer approves; you see what it escalates.")
                 Spacer()
                 Group {
                     if running {

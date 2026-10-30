@@ -3,7 +3,7 @@ import Foundation
 /// Codex is driven through `codex app-server`: JSON-RPC over stdio, the same API the Codex app
 /// and IDE extensions use. It owns Codex's storage, so we never read its databases directly.
 @MainActor final class Codex {
-    static var binary: String? {
+    nonisolated static var binary: String? {
         if let p = UserDefaults.standard.string(forKey: "codexPath"), !p.isEmpty { return p }
         let bundled = ["ChatGPT", "Codex"].map { "/Applications/\($0).app/Contents/Resources/codex-cli/bin/codex" }
         return Env.which("codex", fallbacks: bundled + ["/Applications/Codex.app/Contents/Resources/codex"])
@@ -17,6 +17,7 @@ import Foundation
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
     private var listeners: [String: Listener] = [:]  // by thread id
+    private var stderrTail = ""
 
     // MARK: JSON-RPC plumbing
 
@@ -40,13 +41,20 @@ import Foundation
         p.executableURL = URL(fileURLWithPath: exe)
         p.arguments = ["app-server"]
         p.environment = Env.shared
-        let input = Pipe(), output = Pipe()
+        let input = Pipe(), output = Pipe(), errors = Pipe()
         p.standardInput = input
         p.standardOutput = output
-        p.standardError = FileHandle.nullDevice
+        p.standardError = errors
         try p.run()
         process = p
         stdin = input.fileHandleForWriting
+        errors.fileHandleForReading.readabilityHandler = { h in
+            let chunk = h.availableData
+            if chunk.isEmpty { h.readabilityHandler = nil; return }
+            DispatchQueue.main.async { MainActor.assumeIsolated {
+                self.stderrTail = String((self.stderrTail + String(decoding: chunk, as: UTF8.self)).suffix(600))
+            } }
+        }
         output.fileHandleForReading.readJSONLines({ o in
             DispatchQueue.main.async { MainActor.assumeIsolated { self.receive(o) } }
         }, done: {
@@ -62,7 +70,13 @@ import Foundation
         nextID += 1
         return try await withCheckedThrowingContinuation { c in
             pending[id] = c
-            stdin?.writeJSONLine(["id": id, "method": method, "params": params])
+            guard stdin?.writeJSONLine(["id": id, "method": method, "params": params]) == true else {
+                pending[id] = nil
+                return c.resume(throwing: AppError("Codex app-server isn't running."))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 120) { MainActor.assumeIsolated {
+                self.pending.removeValue(forKey: id)?.resume(throwing: AppError("Codex didn't answer \(method) in 2 minutes."))
+            } }
         }
     }
 
@@ -89,9 +103,10 @@ import Foundation
         guard p === process else { return }
         process = nil
         ready = nil
-        pending.values.forEach { $0.resume(throwing: AppError("Codex app-server stopped.")) }
+        let why = stderrTail.trimmed.isEmpty ? "" : "\n" + stderrTail.trimmed
+        pending.values.forEach { $0.resume(throwing: AppError("Codex app-server stopped." + why)) }
         pending = [:]
-        listeners.values.forEach { $0("agentcenter/closed", [:], nil) }
+        listeners.values.forEach { $0("agentcenter/closed", ["message": "Codex app-server stopped." + why], nil) }
     }
 
     // MARK: Sessions
@@ -132,11 +147,22 @@ import Foundation
         return items
     }
 
+    /// The person's last request and the agent's last words, for AI triage.
+    func lastExchange(_ id: String) async throws -> (prompt: String, reply: String, failed: Bool)? {
+        let r = try await request("thread/turns/list", ["threadId": id, "limit": 1, "sortDirection": "desc", "itemsView": "summary"])
+        guard let turn = (r["data"] as? [[String: Any]])?.first else { return nil }
+        let items = (turn["items"] as? [[String: Any]] ?? []).compactMap(Self.item)
+        let error = (turn["error"] as? [String: Any])?["message"] as? String
+        return (items.last { $0.kind == .user }?.text ?? "",
+                items.last { $0.kind == .assistant }?.text ?? error ?? "(no reply)",
+                turn["status"] as? String == "failed")
+    }
+
     // MARK: Running
 
-    func run(prompt: String, cwd: String, threadID: String?, mode: String) -> Run {
+    func run(prompt: String, cwd: String, threadID: String?, access: Access) -> Run {
         let (events, out) = AsyncStream.makeStream(of: RunEvent.self)
-        var thread = threadID, turn: String?, finished = false
+        var thread = threadID, turn: String?, finished = false, stopped = false
 
         func finish(_ error: String?) {
             guard !finished else { return }
@@ -144,6 +170,11 @@ import Foundation
             if let thread { listeners[thread] = nil }
             out.yield(.done(error))
             out.finish()
+        }
+
+        func interrupt() {
+            guard let thread, let turn else { return }
+            Task { _ = try? await request("turn/interrupt", ["threadId": thread, "turnId": turn]) }
         }
 
         func listen(_ method: String, _ p: [String: Any], _ requestID: Any?) {
@@ -168,11 +199,21 @@ import Foundation
             case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
                 guard let requestID else { return }
                 let title = method.contains("command") ? "$ " + Self.unwrap(p["command"] as? String ?? "command") : "Apply file changes"
-                out.yield(.approval(Approval(id: "\(requestID)", title: title, detail: p["reason"] as? String ?? "") { [weak self] allow in
+                out.yield(.ask(Ask(id: "\(requestID)", title: title, detail: p["reason"] as? String ?? "") { [weak self] allow, _ in
                     self?.stdin?.writeJSONLine(["id": requestID, "result": ["decision": allow ? "accept" : "decline"]])
                 }))
+            case "item/tool/requestUserInput":
+                guard let requestID else { return }
+                let questions = (p["questions"] as? [[String: Any]] ?? []).map { q in
+                    Ask.Question(id: q["id"] as? String ?? "", header: q["header"] as? String ?? "", text: q["question"] as? String ?? "",
+                                 options: (q["options"] as? [[String: Any]] ?? []).compactMap { $0["label"] as? String })
+                }
+                out.yield(.ask(Ask(id: "\(requestID)", title: "Codex has a question", questions: questions) { [weak self] allow, answers in
+                    let reply = allow ? answers.mapValues { ["answers": [$0]] } : [:]
+                    self?.stdin?.writeJSONLine(["id": requestID, "result": ["answers": reply]])
+                }))
             case "agentcenter/closed":
-                finish("Codex app-server stopped.")
+                finish(p["message"] as? String ?? "Codex app-server stopped.")
             default:
                 if let requestID { stdin?.writeJSONLine(["id": requestID, "error": ["code": -32601, "message": "Not supported by AgentCenter"]]) }
             }
@@ -180,11 +221,12 @@ import Foundation
 
         Task {
             do {
-                var options: [String: Any] = [:]
-                switch mode {
-                case "read-only": options = ["sandbox": "read-only", "approvalPolicy": "on-request"]
-                case "full-access": options = ["sandbox": "danger-full-access", "approvalPolicy": "never"]
-                default: break
+                let options: [String: Any]
+                switch access {  // "AI decides": Codex's own reviewer approves; only what it escalates reaches you
+                case .ai: options = ["sandbox": "workspace-write", "approvalPolicy": "on-request", "approvalsReviewer": "auto_review"]
+                case .ask: options = ["sandbox": "workspace-write", "approvalPolicy": "on-request", "approvalsReviewer": "user"]
+                case .readOnly: options = ["sandbox": "read-only", "approvalPolicy": "never"]
+                case .full: options = ["sandbox": "danger-full-access", "approvalPolicy": "never"]
                 }
                 if let id = thread {
                     _ = try await request("thread/resume", options.merging(["threadId": id, "excludeTurns": true]) { $1 })
@@ -195,16 +237,21 @@ import Foundation
                 guard let id = thread else { throw AppError("Codex didn't return a thread id.") }
                 listeners[id] = listen
                 out.yield(.session(id))
+                guard !stopped else {  // Stop arrived while the thread was starting: don't begin the turn
+                    out.yield(.item(Item(id: UUID().uuidString, kind: .status, text: "Stopped")))
+                    return finish(nil)
+                }
                 let r = try await request("turn/start", ["threadId": id, "input": [["type": "text", "text": prompt, "text_elements": []]]])
                 turn = (r["turn"] as? [String: Any])?["id"] as? String
+                if stopped { interrupt() }  // Stop arrived while the turn was starting
             } catch {
                 finish(error.localizedDescription)
             }
         }
 
-        return Run(events: events, stop: { [weak self] in
-            guard let thread, let turn else { return }
-            Task { _ = try? await self?.request("turn/interrupt", ["threadId": thread, "turnId": turn]) }
+        return Run(events: events, stop: {
+            stopped = true
+            interrupt()
         })
     }
 

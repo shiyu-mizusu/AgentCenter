@@ -47,6 +47,49 @@ enum Env {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// Runs a CLI off the main thread, feeding `input` on stdin, and returns its stdout.
+    /// Kills it after `timeout` seconds; a failure with no output throws stderr.
+    static func output(_ exe: String, _ args: [String], input: String, cwd: String = NSTemporaryDirectory(),
+                       timeout: TimeInterval) async throws -> Data {
+        try await withCheckedThrowingContinuation { done in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: exe)
+                p.arguments = args
+                p.environment = shared
+                p.currentDirectoryURL = URL(fileURLWithPath: cwd)
+                let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
+                p.standardInput = stdin
+                p.standardOutput = stdout
+                p.standardError = stderr
+                do { try p.run() } catch { return done.resume(throwing: error) }
+                let kill = DispatchWorkItem { if p.isRunning { p.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: kill)
+                DispatchQueue.global().async {  // write while we read, so a large prompt can't deadlock
+                    try? stdin.fileHandleForWriting.write(contentsOf: Data(input.utf8))
+                    try? stdin.fileHandleForWriting.close()
+                }
+                var errors = Data()
+                let errorsRead = DispatchSemaphore(value: 0)
+                DispatchQueue.global().async {
+                    errors = stderr.fileHandleForReading.readDataToEndOfFile()
+                    errorsRead.signal()
+                }
+                let out = stdout.fileHandleForReading.readDataToEndOfFile()
+                errorsRead.wait()
+                p.waitUntilExit()
+                kill.cancel()
+                if p.terminationReason == .uncaughtSignal {
+                    done.resume(throwing: AppError("\((exe as NSString).lastPathComponent) took longer than \(Int(timeout))s."))
+                } else if p.terminationStatus != 0, out.isEmpty {
+                    done.resume(throwing: AppError(String(decoding: errors.suffix(500), as: UTF8.self).trimmed))
+                } else {
+                    done.resume(returning: out)
+                }
+            }
+        }
+    }
+
     /// Opens a Terminal window running `command` in `cwd`. A self-deleting .command file needs no Automation permission.
     static func openInTerminal(_ command: String, in cwd: String) {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("AgentCenter-\(UUID().uuidString.prefix(8)).command")
@@ -88,10 +131,11 @@ extension FileHandle {
         }
     }
 
-    /// Writes one JSON object as a line; silently drops it if the process is gone.
-    func writeJSONLine(_ object: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
-        try? write(contentsOf: data + [0x0A])
+    /// Writes one JSON object as a line. False if it couldn't (the process is gone).
+    @discardableResult
+    func writeJSONLine(_ object: [String: Any]) -> Bool {
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return false }
+        return (try? write(contentsOf: data + [0x0A])) != nil
     }
 }
 

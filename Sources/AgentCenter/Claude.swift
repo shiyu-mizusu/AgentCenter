@@ -242,14 +242,73 @@ enum Claude {
             .joined(separator: "\n")
     }
 
+    /// The person's last request and the agent's last words, for AI triage. Reads only the tail of the file,
+    /// widening once when screenshots or big tool results fill it.
+    static func lastExchange(_ url: URL) -> (prompt: String, reply: String, failed: Bool)? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        for window: UInt64 in [256 << 10, 4 << 20] {
+            try? h.seek(toOffset: size - min(size, window))
+            if let found = lastExchange(in: h.readDataToEndOfFile()) { return found }
+            if window >= size { break }
+        }
+        return nil
+    }
+
+    private static func lastExchange(in tail: Data) -> (prompt: String, reply: String, failed: Bool)? {
+        let marker = Data("{\"parentUuid\"".utf8)  // user/assistant records; skips the large bookkeeping lines
+        var lines: [Data] = []
+        tail.forEachLine { line in
+            if line.starts(with: marker) { lines.append(line) }
+            return true
+        }
+        var prompt: String?, reply: String?, toolsAfter = false
+        for line in lines.reversed() where prompt == nil {
+            guard let o = json(line), o["isSidechain"] as? Bool != true, o["isMeta"] as? Bool != true,
+                  let content = (o["message"] as? [String: Any])?["content"] else { continue }
+            let blocks = content as? [[String: Any]] ?? []
+            if o["type"] as? String == "assistant", reply == nil {
+                let text = blocks.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }.joined(separator: "\n").trimmed
+                if !text.isEmpty { reply = text } else if blocks.contains(where: { $0["type"] as? String == "tool_use" }) { toolsAfter = true }
+            } else if o["type"] as? String == "user", let text = userText(content), !text.hasPrefix("<") {
+                if text.hasPrefix("[Request interrupted") {
+                    reply = reply ?? "(stopped by the developer)"
+                } else {
+                    prompt = text
+                    reply = reply ?? "(no reply to this yet)"  // the request came after the agent's last words
+                }
+            }
+        }
+        // Long agentic runs can push the request out of the tail; the agent's last words still say where it stands.
+        guard var reply else { return nil }
+        if toolsAfter { reply += "\n\n(After this message it kept calling tools.)" }
+        return (prompt ?? "(earlier in the session)", reply, false)
+    }
+
     // MARK: Running
 
-    static func run(prompt: String, cwd: String, resume: String?, mode: String) -> Run {
+    private static var live = Set<Process>()  // main thread only
+
+    /// Quitting: end every Claude process this app started.
+    static func terminateAll() {
+        live.forEach { $0.terminate() }
+    }
+
+    static func run(prompt: String, cwd: String, resume: String?, access: Access) -> Run {
         let (events, out) = AsyncStream.makeStream(of: RunEvent.self)
         guard let exe = binary else {
             out.yield(.done(missing))
             out.finish()
             return Run(events: events, stop: {})
+        }
+        let permissions: [String]
+        switch access {
+        case .ai: permissions = ["--permission-mode", "auto"]
+        case .ask: permissions = []  // the person's own default; prompts come to us over stdio
+        case .readOnly: permissions = ["--permission-mode", "plan", "--allowedTools",
+                                       "Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*)"]
+        case .full: permissions = ["--permission-mode", "bypassPermissions"]
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: exe)
@@ -257,7 +316,7 @@ enum Claude {
         p.environment = Env.shared
         p.arguments = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                        "--include-partial-messages", "--permission-prompt-tool", "stdio"]
-            + (mode.isEmpty ? [] : ["--permission-mode", mode])
+            + permissions
             + (resume.map { ["--resume", $0] } ?? [])
         let input = Pipe(), output = Pipe(), errors = Pipe()
         p.standardInput = input
@@ -272,6 +331,7 @@ enum Claude {
         func finish(_ error: String?) {
             guard !finished else { return }
             finished = true
+            live.remove(p)
             try? stdin.close()
             if stopped, !items.contains(where: { $0.text == "Interrupted" }) {  // the CLI usually says so itself
                 out.yield(.item(Item(id: UUID().uuidString, kind: .status, text: "Stopped")))
@@ -295,17 +355,28 @@ enum Claude {
                       req["subtype"] as? String == "can_use_tool" else { return }
                 let name = req["tool_name"] as? String ?? "tool"
                 let toolInput = req["input"] as? [String: Any] ?? [:]
-                func reply(_ allow: Bool, _ why: String = "The user declined this in AgentCenter.") {
-                    let decision: [String: Any] = allow ? ["behavior": "allow", "updatedInput": toolInput] : ["behavior": "deny", "message": why]
+                func reply(_ allow: Bool, input: [String: Any]) {
+                    let decision: [String: Any] = allow ? ["behavior": "allow", "updatedInput": input]
+                        : ["behavior": "deny", "message": "The user declined this in AgentCenter."]
                     stdin.writeJSONLine(["type": "control_response",
                                          "response": ["subtype": "success", "request_id": rid, "response": decision]])
                 }
-                if name == "AskUserQuestion" {  // no multiple-choice UI here; plain text works just as well
-                    return reply(false, "AgentCenter can't show multiple-choice questions. Ask in plain text instead.")
+                if name == "AskUserQuestion" {  // answered by passing `answers` (question text → choice) back in the input
+                    let questions = (toolInput["questions"] as? [[String: Any]] ?? []).map { q in
+                        Ask.Question(id: q["question"] as? String ?? "", header: q["header"] as? String ?? "",
+                                     text: q["question"] as? String ?? "",
+                                     options: (q["options"] as? [[String: Any]] ?? []).compactMap { $0["label"] as? String })
+                    }
+                    out.yield(.ask(Ask(id: rid, title: "Claude has a question", questions: questions) { allow, answers in
+                        var input = toolInput
+                        input["answers"] = answers
+                        reply(allow, input: input)
+                    }))
+                    return
                 }
                 let t = tool(name, toolInput)
                 let detail = req["description"] as? String ?? toolInput["plan"] as? String ?? ""
-                out.yield(.approval(Approval(id: rid, title: t.title, detail: detail, respond: { reply($0) })))
+                out.yield(.ask(Ask(id: rid, title: t.title, detail: detail) { allow, _ in reply(allow, input: toolInput) }))
             case "result":
                 let ok = o["subtype"] as? String == "success" && o["is_error"] as? Bool != true
                 finish(ok ? nil : o["result"] as? String ?? (o["errors"] as? [String])?.joined(separator: "\n") ?? "Claude stopped with an error.")
@@ -335,6 +406,7 @@ enum Claude {
             out.finish()
             return Run(events: events, stop: {})
         }
+        live.insert(p)
         stdin.writeJSONLine(["type": "user", "session_id": "", "parent_tool_use_id": NSNull(),
                              "message": ["role": "user", "content": [["type": "text", "text": prompt]]]])
 
