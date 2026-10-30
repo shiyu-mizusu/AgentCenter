@@ -10,7 +10,7 @@ AgentCenter finds every session you've had with **Claude Code** (in the terminal
 
 ## What it does
 
-- **Every session, one list.** Claude Code and Codex side by side, newest first, grouped by project folder, searchable.
+- **Every session, one list.** Claude Code and Codex side by side, newest first, grouped by project folder, searchable. Sessions you archived in either app stay hidden.
 - **Readable transcripts.** Messages, commands, file edits and their output. Tool calls stay collapsed until you want them.
 - **Continue or start tasks.** Reply to any session or start a new one with either agent. Replies stream in live.
 - **Approve from the app.** When an agent wants to run a command or edit a file, you get an Allow / Deny card.
@@ -19,13 +19,17 @@ AgentCenter finds every session you've had with **Claude Code** (in the terminal
 
 ## Install
 
-Download `AgentCenter-x.y.z.zip` from [Releases](../../releases), unzip it, and drag **AgentCenter** to Applications.
-The build is ad-hoc signed, so the first time, right-click the app and choose **Open**.
+Download `AgentCenter-x.y.z.zip` from [Releases](https://github.com/shiyu-mizusu/AgentCenter/releases), unzip it, and drag **AgentCenter** to Applications.
+The build isn't notarized yet, so macOS blocks the first launch. Open **System Settings → Privacy & Security** and click **Open Anyway**, or run:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/AgentCenter.app
+```
 
 Or build it yourself (Xcode 16 or later):
 
 ```bash
-git clone https://github.com/<you>/AgentCenter.git && cd AgentCenter && scripts/build-app.sh && open build/AgentCenter.app
+git clone https://github.com/shiyu-mizusu/AgentCenter.git && cd AgentCenter && scripts/build-app.sh && open build/AgentCenter.app
 ```
 
 **Requirements:** macOS 14 or later, plus at least one agent:

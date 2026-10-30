@@ -57,23 +57,42 @@ enum Claude {
                 lock.unlock()
             }
         }
-        return found.compactMap { $0 }
+        let desktop = desktopSessions()
+        return found.compactMap { s in
+            guard var s, desktop[s.id]?.archived != true else { return nil }  // archived in the Claude app: hide here too
+            s.desktopID = desktop[s.id]?.id
+            return s
+        }
+    }
+
+    /// The Claude app's own records of the sessions it started: CLI session id → its "local_…" id and archive state.
+    static func desktopSessions() -> [String: (id: String, archived: Bool)] {
+        let store = NSHomeDirectory() + "/Library/Application Support/Claude/claude-code-sessions"
+        let paths = (FileManager.default.enumerator(atPath: store)?.allObjects as? [String] ?? [])
+            .filter { ($0 as NSString).lastPathComponent.hasPrefix("local_") && $0.hasSuffix(".json") }
+        var out: [String: (id: String, archived: Bool)] = [:]
+        for path in paths {
+            guard let h = FileHandle(forReadingAtPath: "\(store)/\(path)") else { continue }
+            let head = String(decoding: (try? h.read(upToCount: 8 << 10)) ?? Data(), as: UTF8.self)  // ids sit at the top
+            try? h.close()
+            if let cli = head.capture("\"cliSessionId\":\"([^\"]+)\""), let id = head.capture("\"sessionId\":\"(local_[^\"]+)\"") {
+                out[cli] = (id, head.contains("\"isArchived\":true"))
+            }
+        }
+        return out
     }
 
     /// Reads only the head (cwd, first prompt) and tail (latest title) — transcripts can be hundreds of MB.
     static func summarize(_ url: URL, modified: Date) -> Session? {
         guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? h.close() }
-        var cwd: String?, branch: String?, prompt: String?, desktop = false
+        var cwd: String?, branch: String?, prompt: String?
         for limit in [64 << 10, 1 << 20] where prompt == nil {  // the first prompt can sit behind a big paste
             try? h.seek(toOffset: 0)
             let head = (try? h.read(upToCount: limit)) ?? Data()
             head.forEachLine { line in
                 guard let o = json(line) else { return true }
-                if cwd == nil, let c = o["cwd"] as? String {
-                    cwd = c
-                    desktop = o["entrypoint"] as? String == "claude-desktop"
-                }
+                if cwd == nil { cwd = o["cwd"] as? String }
                 if branch == nil, let b = o["gitBranch"] as? String, !b.isEmpty, b != "HEAD" { branch = b }
                 if prompt == nil, o["type"] as? String == "user", o["isSidechain"] as? Bool != true, o["isMeta"] as? Bool != true,
                    let text = userText((o["message"] as? [String: Any])?["content"]), !text.hasPrefix("<") {
@@ -92,7 +111,7 @@ enum Claude {
             ?? record("summary", "summary", in: tail)
         guard let name = title ?? prompt else { return nil }
         return Session(id: url.deletingPathExtension().lastPathComponent, agent: .claude, title: name.firstLine(),
-                       cwd: cwd, updated: modified, branch: branch, file: url, fromDesktop: desktop)
+                       cwd: cwd, updated: modified, branch: branch, file: url)
     }
 
     /// `key` of the last `{"type":"<type>",…}` line in `data` (titles get re-appended as sessions are renamed).

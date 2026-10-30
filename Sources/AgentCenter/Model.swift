@@ -26,7 +26,7 @@ struct Session: Identifiable, Hashable {
     var updated: Date
     var branch: String? = nil
     var file: URL? = nil           // Claude transcript
-    var fromDesktop = false        // Claude: started in the Claude app, so it can reopen there
+    var desktopID: String? = nil   // Claude: the Claude app's id, when it started this session
 
     /// Agent worktrees (…/repo/.claude/worktrees/x) belong to their repo.
     var project: String {
@@ -233,7 +233,7 @@ struct AppError: LocalizedError {
 
     func appURL(_ s: Session) -> URL? {
         switch s.agent {
-        case .claude: s.fromDesktop ? URL(string: "claude://code/continue?session=\(s.id)") : nil
+        case .claude: s.desktopID.flatMap { URL(string: "claude://code/continue?session=\($0)") }
         case .codex: URL(string: "codex://threads/\(s.id)")
         }
     }

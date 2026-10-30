@@ -5,7 +5,7 @@ final class ParsingTests: XCTestCase {
     func testClaudeSessionFile() throws {
         let lines = [
             #"{"type":"custom-title","customTitle":"Old name","sessionId":"s1"}"#,
-            #"{"parentUuid":null,"isSidechain":false,"type":"user","isMeta":true,"cwd":"/tmp/demo","entrypoint":"claude-desktop","gitBranch":"main","uuid":"u0","message":{"role":"user","content":"Caveat: ignore"}}"#,
+            #"{"parentUuid":null,"isSidechain":false,"type":"user","isMeta":true,"cwd":"/tmp/demo","gitBranch":"main","uuid":"u0","message":{"role":"user","content":"Caveat: ignore"}}"#,
             #"{"parentUuid":"u0","isSidechain":false,"type":"user","cwd":"/tmp/demo","uuid":"u1","message":{"role":"user","content":"<system-reminder>noise</system-reminder>Fix the login bug"}}"#,
             #"{"parentUuid":"u1","isSidechain":false,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"}]},"type":"assistant","uuid":"a1"}"#,
             #"{"parentUuid":"a1","isSidechain":false,"message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm test"}}]},"type":"assistant","uuid":"a2"}"#,
@@ -23,7 +23,6 @@ final class ParsingTests: XCTestCase {
         XCTAssertEqual(session.title, "Login bug")  // the latest rename wins
         XCTAssertEqual(session.cwd, "/tmp/demo")
         XCTAssertEqual(session.branch, "main")
-        XCTAssertTrue(session.fromDesktop)
 
         let items = Claude.transcript(url)
         XCTAssertEqual(items.map(\.kind), [.user, .tool, .assistant, .user])
